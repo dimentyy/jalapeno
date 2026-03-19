@@ -1,0 +1,399 @@
+package mobile
+
+import (
+	"encoding/binary"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"sync"
+	"sync/atomic"
+
+	"github.com/gorilla/websocket"
+	"github.com/xjasonlyu/tun2socks/v2/engine"
+)
+
+const (
+	msgConnect    byte = 0x01
+	msgConnectOK  byte = 0x02
+	msgConnectErr byte = 0x03
+	msgData       byte = 0x04
+	msgClose      byte = 0x05
+)
+
+const readBufSize = 65536
+
+var framePool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 5+readBufSize)
+		return &buf
+	},
+}
+
+func encodeFrameInto(buf []byte, connID uint32, msgType byte, payload []byte) int {
+	binary.BigEndian.PutUint32(buf[0:4], connID)
+	buf[4] = msgType
+	copy(buf[5:], payload)
+	return 5 + len(payload)
+}
+
+func decodeFrame(data []byte) (connID uint32, msgType byte, payload []byte) {
+	if len(data) < 5 {
+		return 0, 0, nil
+	}
+	connID = binary.BigEndian.Uint32(data[0:4])
+	msgType = data[4]
+	payload = data[5:]
+	return
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin:     func(r *http.Request) bool { return true },
+	ReadBufferSize:  readBufSize,
+	WriteBufferSize: readBufSize,
+}
+
+type LogCallback interface {
+	OnLog(msg string)
+}
+
+var logCb LogCallback
+
+func logMsg(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	log.Print(msg)
+	if logCb != nil {
+		logCb.OnLog(msg)
+	}
+}
+
+func StartTun2Socks(fd, mtu, socksPort int) error {
+	proxy := fmt.Sprintf("socks5://127.0.0.1:%d", socksPort)
+	logMsg("tun2socks: starting fd=%d mtu=%d proxy=%s", fd, mtu, proxy)
+	os.Setenv("TUN2SOCKS_LOG_LEVEL", "info")
+	key := &engine.Key{
+		Proxy:  proxy,
+		Device: fmt.Sprintf("fd://%d", fd),
+		MTU:    mtu,
+	}
+	engine.Insert(key)
+	engine.Start()
+	logMsg("tun2socks: running")
+	return nil
+}
+
+func StopTun2Socks() {
+	engine.Stop()
+	logMsg("tun2socks: stopped")
+}
+
+type wsWriter struct {
+	ws   *websocket.Conn
+	ch   chan []byte
+	done chan struct{}
+}
+
+func newWSWriter(ws *websocket.Conn) *wsWriter {
+	w := &wsWriter{
+		ws:   ws,
+		ch:   make(chan []byte, 1024),
+		done: make(chan struct{}),
+	}
+	go w.loop()
+	return w
+}
+
+func (w *wsWriter) loop() {
+	defer close(w.done)
+	for msg := range w.ch {
+		if err := w.ws.WriteMessage(websocket.BinaryMessage, msg); err != nil {
+			logMsg("ws write error: %v", err)
+			return
+		}
+	}
+}
+
+func (w *wsWriter) send(msg []byte) {
+	cp := make([]byte, len(msg))
+	copy(cp, msg)
+	select {
+	case w.ch <- cp:
+	default:
+	}
+}
+
+func (w *wsWriter) close() {
+	close(w.ch)
+	<-w.done
+}
+
+func StartJoiner(wsPort, socksPort int, cb LogCallback) error {
+	logCb = cb
+	j := &joinerRelay{
+		conns: sync.Map{},
+		ready: make(chan struct{}),
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", j.handleWS)
+	go func() {
+		addr := fmt.Sprintf("127.0.0.1:%d", wsPort)
+		logMsg("joiner: WebSocket on %s", addr)
+		if err := http.ListenAndServe(addr, mux); err != nil {
+			logMsg("joiner: ws server error: %v", err)
+		}
+	}()
+	addr := fmt.Sprintf("127.0.0.1:%d", socksPort)
+	logMsg("joiner: SOCKS5 on %s", addr)
+	return j.listenSOCKS(addr)
+}
+
+func StartCreator(wsPort int, cb LogCallback) error {
+	logCb = cb
+	c := &creatorRelay{
+		conns: sync.Map{},
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", c.handleWS)
+	addr := fmt.Sprintf("127.0.0.1:%d", wsPort)
+	logMsg("creator: WebSocket on %s", addr)
+	return http.ListenAndServe(addr, mux)
+}
+
+type joinerRelay struct {
+	writer *wsWriter
+	conns  sync.Map
+	nextID atomic.Uint32
+	ready  chan struct{}
+	once   sync.Once
+}
+
+type socksConn struct {
+	id   uint32
+	conn net.Conn
+	j    *joinerRelay
+	rdy  chan error
+}
+
+func (j *joinerRelay) handleWS(w http.ResponseWriter, r *http.Request) {
+	ws, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		logMsg("joiner: ws upgrade error: %v", err)
+		return
+	}
+	j.writer = newWSWriter(ws)
+	j.once.Do(func() { close(j.ready) })
+	logMsg("joiner: browser connected via WebSocket")
+	for {
+		_, msg, err := ws.ReadMessage()
+		if err != nil {
+			logMsg("joiner: ws read error: %v", err)
+			return
+		}
+		connID, msgType, payload := decodeFrame(msg)
+		j.handleMessage(connID, msgType, payload)
+	}
+}
+
+func (j *joinerRelay) handleMessage(connID uint32, msgType byte, payload []byte) {
+	val, ok := j.conns.Load(connID)
+	if !ok {
+		return
+	}
+	sc := val.(*socksConn)
+	switch msgType {
+	case msgConnectOK:
+		sc.rdy <- nil
+	case msgConnectErr:
+		sc.rdy <- fmt.Errorf("%s", payload)
+	case msgData:
+		sc.conn.Write(payload)
+	case msgClose:
+		sc.conn.Close()
+		j.conns.Delete(connID)
+	}
+}
+
+func (j *joinerRelay) send(connID uint32, msgType byte, payload []byte) {
+	w := j.writer
+	if w == nil {
+		return
+	}
+	bufp := framePool.Get().(*[]byte)
+	buf := *bufp
+	n := encodeFrameInto(buf, connID, msgType, payload)
+	w.send(buf[:n])
+	framePool.Put(bufp)
+}
+
+func (j *joinerRelay) listenSOCKS(addr string) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return err
+	}
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			logMsg("joiner: accept error: %v", err)
+			continue
+		}
+		go j.handleSOCKS(conn)
+	}
+}
+
+func (j *joinerRelay) handleSOCKS(conn net.Conn) {
+	<-j.ready
+	buf := make([]byte, 258)
+	n, err := conn.Read(buf)
+	if err != nil || n < 2 || buf[0] != 0x05 {
+		conn.Close()
+		return
+	}
+	conn.Write([]byte{0x05, 0x00})
+	n, err = conn.Read(buf)
+	if err != nil || n < 7 || buf[0] != 0x05 || buf[1] != 0x01 {
+		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		conn.Close()
+		return
+	}
+	var host string
+	switch buf[3] {
+	case 0x01:
+		if n < 10 {
+			conn.Close()
+			return
+		}
+		host = fmt.Sprintf("%d.%d.%d.%d:%d", buf[4], buf[5], buf[6], buf[7],
+			binary.BigEndian.Uint16(buf[8:10]))
+	case 0x03:
+		dlen := int(buf[4])
+		if n < 5+dlen+2 {
+			conn.Close()
+			return
+		}
+		host = fmt.Sprintf("%s:%d", string(buf[5:5+dlen]),
+			binary.BigEndian.Uint16(buf[5+dlen:7+dlen]))
+	case 0x04:
+		if n < 22 {
+			conn.Close()
+			return
+		}
+		ip := net.IP(buf[4:20])
+		host = fmt.Sprintf("[%s]:%d", ip.String(),
+			binary.BigEndian.Uint16(buf[20:22]))
+	default:
+		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		conn.Close()
+		return
+	}
+	id := j.nextID.Add(1)
+	sc := &socksConn{id: id, conn: conn, j: j, rdy: make(chan error, 1)}
+	j.conns.Store(id, sc)
+	logMsg("joiner: CONNECT %d -> %s", id, host)
+	j.send(id, msgConnect, []byte(host))
+	if err := <-sc.rdy; err != nil {
+		logMsg("joiner: CONNECT %d failed: %v", id, err)
+		conn.Write([]byte{0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		conn.Close()
+		j.conns.Delete(id)
+		return
+	}
+	conn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	logMsg("joiner: CONNECTED %d -> %s", id, host)
+	go func() {
+		buf := make([]byte, readBufSize)
+		for {
+			n, err := conn.Read(buf)
+			if n > 0 {
+				j.send(id, msgData, buf[:n])
+			}
+			if err != nil {
+				j.send(id, msgClose, nil)
+				j.conns.Delete(id)
+				return
+			}
+		}
+	}()
+}
+
+type creatorRelay struct {
+	writer *wsWriter
+	conns  sync.Map
+}
+
+func (c *creatorRelay) handleWS(w http.ResponseWriter, r *http.Request) {
+	ws, err := upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		logMsg("creator: ws upgrade error: %v", err)
+		return
+	}
+	c.writer = newWSWriter(ws)
+	logMsg("creator: browser connected via WebSocket")
+	for {
+		_, msg, err := ws.ReadMessage()
+		if err != nil {
+			logMsg("creator: ws read error: %v", err)
+			return
+		}
+		connID, msgType, payload := decodeFrame(msg)
+		c.handleMessage(connID, msgType, payload)
+	}
+}
+
+func (c *creatorRelay) handleMessage(connID uint32, msgType byte, payload []byte) {
+	switch msgType {
+	case msgConnect:
+		go c.connect(connID, string(payload))
+	case msgData:
+		val, ok := c.conns.Load(connID)
+		if ok {
+			val.(net.Conn).Write(payload)
+		}
+	case msgClose:
+		val, ok := c.conns.LoadAndDelete(connID)
+		if ok {
+			val.(net.Conn).Close()
+		}
+	}
+}
+
+func (c *creatorRelay) send(connID uint32, msgType byte, payload []byte) {
+	w := c.writer
+	if w == nil {
+		return
+	}
+	bufp := framePool.Get().(*[]byte)
+	buf := *bufp
+	n := encodeFrameInto(buf, connID, msgType, payload)
+	w.send(buf[:n])
+	framePool.Put(bufp)
+}
+
+func (c *creatorRelay) connect(connID uint32, addr string) {
+	logMsg("creator: CONNECT %d -> %s", connID, addr)
+	conn, err := net.DialTimeout("tcp", addr, 10e9)
+	if err != nil {
+		logMsg("creator: CONNECT %d failed: %v", connID, err)
+		c.send(connID, msgConnectErr, []byte(err.Error()))
+		return
+	}
+	c.conns.Store(connID, conn)
+	c.send(connID, msgConnectOK, nil)
+	logMsg("creator: CONNECTED %d -> %s", connID, addr)
+	buf := make([]byte, readBufSize)
+	for {
+		n, err := conn.Read(buf)
+		if n > 0 {
+			c.send(connID, msgData, buf[:n])
+		}
+		if err != nil {
+			if err != io.EOF {
+				logMsg("creator: conn %d read error: %v", connID, err)
+			}
+			break
+		}
+	}
+	c.send(connID, msgClose, nil)
+	c.conns.Delete(connID)
+}
