@@ -497,7 +497,7 @@
   };
 
   let origParse = JSON.parse;
-  JSON.parse = (str) => {
+  JSON.parse = function (str) {
     let result = origParse.apply(JSON, arguments);
     if (
       result &&
