@@ -23,25 +23,25 @@
       { "from": "../hooks/video-telemost.js", "to": "hooks/video-telemost.js" }
     ],
     "mac": {
-      "target": "dmg",
+      "target": { "target": "dmg", "arch": "arm64" },
       "icon": "resources/icon.icns",
       "extraResources": [
         { "from": "../relay/relay-darwin", "to": "relay" }
       ]
     },
     "win": {
-      "target": "portable",
+      "target": { "target": "portable", "arch": "x64" },
       "artifactName": "${productName}-${version}-${arch}.${ext}",
       "icon": "resources/icon.ico",
       "extraResources": [
-        { "from": "../relay/relay-bundle.exe", "to": "relay.exe" }
+        { "from": "../relay/relay-windows-x64.exe", "to": "relay.exe" }
       ]
     },
     "linux": {
-      "target": "AppImage",
+      "target": { "target": "AppImage", "arch": "x64" },
       "icon": "resources/icon.png",
       "extraResources": [
-        { "from": "../relay/relay-bundle", "to": "relay" }
+        { "from": "../relay/relay-linux-x64", "to": "relay" }
       ]
     }
   }
