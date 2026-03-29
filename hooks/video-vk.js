@@ -45,7 +45,7 @@
   }
 
   function sendToPion(type, data) {
-    let msg = JSON.stringify({ type: type, data: data });
+    let msg = JSON.stringify({ type, data });
     if (pionReady && pionWS && pionWS.readyState === 1) {
       pionWS.send(msg);
     } else {
@@ -56,7 +56,7 @@
   function requestPion(type, data) {
     let id = ++requestId;
     return new Promise(function (resolve, reject) {
-      pendingRequests[id] = { resolve: resolve, reject: reject };
+      pendingRequests[id] = { resolve, reject };
       let msg = JSON.stringify({ type, data, id });
       if (pionReady && pionWS && pionWS.readyState === 1) {
         pionWS.send(msg);
@@ -539,54 +539,54 @@
   }
 
   function handleIncoming(msg) {
-    if (msg.type === "notification") {
-      if (
-        msg.notification === "connection" &&
-        msg.conversationParams &&
-        msg.conversationParams.turn
-      ) {
-        let turn = msg.conversationParams.turn;
-        log("TURN servers:", turn.urls.length);
-        sendToPion("ice-servers", [
-          {
-            urls: turn.urls,
-            username: turn.username,
-            credential: turn.credential,
-          },
-        ]);
-      }
-      if (msg.notification === "transmitted-data" && msg.data) {
-        if (msg.data.candidate) {
-          sendToPion("remote-ice-candidate", msg.data.candidate);
+    switch (msg.type) {
+      case "notification":
+        switch (msg.notification) {
+          case "connection":
+            if (msg.conversationParams && msg.conversationParams.turn) {
+              let turn = msg.conversationParams.turn;
+              log("TURN servers:", turn.urls.length);
+              sendToPion("ice-servers", [
+                {
+                  urls: turn.urls,
+                  username: turn.username,
+                  credential: turn.credential,
+                },
+              ]);
+            }
+            break;
+          case "transmitted-data":
+            if (msg.data) {
+              if (msg.data.candidate) {
+                sendToPion("remote-ice-candidate", msg.data.candidate);
+              }
+              if (msg.data.sdp) {
+                log("VK incoming SDP: type=" + msg.data.sdp.type);
+              }
+            }
+            break;
+          case "remote-media-settings":
+          case "media-settings":
+          case "media-settings-changed":
+            log(
+              "VK media-settings notification:",
+              JSON.stringify(msg).substring(0, 300),
+            );
+            break;
+          case "participant-added":
+          case "participant-removed":
+            log("VK participant event: " + msg.notification);
+            break;
         }
-        if (msg.data.sdp) {
-          log("VK incoming SDP: type=" + msg.data.sdp.type);
+        break;
+      case "response":
+        if (msg.data && msg.data.mediaSettings) {
+          log(
+            "VK response mediaSettings: isVideoEnabled=" +
+              msg.data.mediaSettings.isVideoEnabled,
+          );
         }
-      }
-      if (
-        msg.notification === "remote-media-settings" ||
-        msg.notification === "media-settings" ||
-        msg.notification === "media-settings-changed"
-      ) {
-        log(
-          "VK media-settings notification:",
-          JSON.stringify(msg).substring(0, 300),
-        );
-      }
-      if (
-        msg.notification === "participant-added" ||
-        msg.notification === "participant-removed"
-      ) {
-        log("VK participant event: " + msg.notification);
-      }
-    }
-    if (msg.type === "response") {
-      if (msg.data && msg.data.mediaSettings) {
-        log(
-          "VK response mediaSettings: isVideoEnabled=" +
-            msg.data.mediaSettings.isVideoEnabled,
-        );
-      }
+        break;
     }
   }
 
